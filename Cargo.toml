@@ -4,16 +4,27 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-xilem = { version = "0.3", features = ["winit"] }
-xilem_core = "0.3"
-winit = "0.30"
-wgpu = "0.20"
-tokio = { version = "1", features = ["full"] }
+# Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+
+# JNI for Android Bridge
 jni = "0.21"
-image = "0.25"
+jni-sys = "0.3"
+
+# Utilities
 uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"
+anyhow = "1"
+thiserror = "1"
+lazy_static = "1.4"
 
 [lib]
-crate-type = ["rlib", "cdylib"]
+name = "scanner_signature_app"
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
