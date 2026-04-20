@@ -1,0 +1,219 @@
+// Copyright 2024 the Xilem Authors
+// SPDX-License-Identifier: Apache-2.0
+
+//! A playground used in the development for new Xilem Masonry features.
+
+use std::time::Duration;
+
+use masonry::layout::{Dim, Length};
+use winit::error::EventLoopError;
+use xilem::core::{Resource, fork, provides, run_once, with_context, without_elements};
+use xilem::kurbo::{Axis, Size};
+use xilem::style::Style as _;
+use xilem::tokio::time;
+use xilem::view::{
+    FlexExt as _, FlexSpacer, MainAxisAlignment, PointerButton, button_any_pointer, checkbox, flex,
+    flex_col, flex_row, label, prose, resize_observer, task, text_button, text_input,
+};
+use xilem::{
+    AnyWidgetView, EventLoop, EventLoopBuilder, FontWeight, InsertNewline, TextAlign, WidgetView,
+    WindowOptions, Xilem, palette,
+};
+
+const LOREM: &str = r"Lorem ipsum dolor sit amet, consectetur adipiscing elit. Morbi cursus mi sed euismod euismod. Orci varius natoque penatibus et magnis dis parturient montes, nascetur ridiculus mus. Nullam placerat efficitur tellus at semper. Morbi ac risus magna. Donec ut cursus ex. Etiam quis posuere tellus. Mauris posuere dui et turpis mollis, vitae luctus tellus consectetur. Lorem ipsum dolor sit amet, consectetur adipiscing elit. Curabitur eu facilisis nisl.
+
+Phasellus in viverra dolor, vitae facilisis est. Maecenas malesuada massa vel ultricies feugiat. Vivamus venenatis et nibh nec pharetra. Phasellus vestibulum elit enim, nec scelerisque orci faucibus id. Vivamus consequat purus sit amet orci egestas, non iaculis massa porttitor. Vestibulum ut eros leo. In fermentum convallis magna in finibus. Donec justo leo, maximus ac laoreet id, volutpat ut elit. Mauris sed leo non neque laoreet faucibus. Aliquam orci arcu, faucibus in molestie eget, ornare non dui. Donec volutpat nulla in fringilla elementum. Aliquam vitae ante egestas ligula tempus vestibulum sit amet sed ante. ";
+
+#[derive(Debug)]
+struct SomeContext(u32);
+impl Resource for SomeContext {}
+
+/// A test for using resources.
+///
+/// Requires the `SomeContext` resource to be [provided](provides).
+fn env_using() -> impl WidgetView<AppData> + use<> {
+    with_context(|context: &mut SomeContext, _: &mut AppData| {
+        Box::new(text_button(
+            format!("Context: {}", context.0),
+            |_: &mut AppData| {
+                tracing::warn!("Does nothing");
+            },
+        )) as Box<AnyWidgetView<AppData>>
+    })
+}
+
+fn app_logic(data: &mut AppData) -> impl WidgetView<AppData> + use<> {
+    // here's some logic, deriving state for the view from our state
+    let count = data.count;
+    let button_label = if count == 1 {
+        "clicked 1 time".to_string()
+    } else {
+        format!("clicked {count} times")
+    };
+
+    // The actual UI Code starts here
+
+    let axis = if data.active {
+        Axis::Horizontal
+    } else {
+        Axis::Vertical
+    };
+
+    let flex_sequence = (0..count)
+        .map(|x: i32| {
+            (
+                Box::new(text_button(format!("+{x}"), move |data: &mut AppData| {
+                    data.count += x;
+                })) as Box<AnyWidgetView<AppData>>,
+                if data.active {
+                    FlexSpacer::Flex(x as f64)
+                } else {
+                    FlexSpacer::Fixed(Length::px((count - x) as f64))
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let fizz_buzz_flex_sequence = [(3, "Fizz"), (5, "Buzz")].map(|c| {
+        if data.count.abs() % c.0 == 0 {
+            text_button(c.1, move |data: &mut AppData| {
+                data.count += 1;
+            })
+            .into_any_flex()
+        } else {
+            FlexSpacer::Fixed(Length::px(10.0 * c.0 as f64)).into_any_flex()
+        }
+    });
+
+    provides(
+        |_: &mut AppData| SomeContext(120),
+        fork(
+            flex_col((
+                env_using(),
+                flex_row((
+                    label("Label").color(palette::css::REBECCA_PURPLE),
+                    label("Bold Label").weight(FontWeight::BOLD),
+                    // TODO masonry doesn't allow setting disabled manually anymore?
+                    // label("Disabled label").disabled(),
+                ))
+                .main_axis_alignment(MainAxisAlignment::Center),
+                flex_row(
+                    text_input(
+                        data.text_input_contents.clone(),
+                        |data: &mut AppData, new_value| {
+                            data.text_input_contents = new_value;
+                        },
+                    )
+                    .insert_newline(InsertNewline::OnEnter)
+                    .flex(1.),
+                ),
+                prose(LOREM)
+                    .text_alignment(TextAlign::Center)
+                    .text_size(18.),
+                button_any_pointer(
+                    label(button_label),
+                    |data: &mut AppData, button| match button {
+                        None => {
+                            // Usually this is a touch.
+                        }
+                        Some(PointerButton::Primary) => data.count += 1,
+                        Some(PointerButton::Secondary) => data.count -= 1,
+                        Some(PointerButton::Auxiliary) => data.count *= 2,
+                        _ => (),
+                    },
+                ),
+                resize_observer(
+                    |data: &mut AppData, new_size| data.observed_size = new_size,
+                    // Correct to use this `label` as a child of resize_observer,
+                    // because it currently takes up the full width of the window.
+                    label(format!("The window is {}px wide", data.observed_size.width))
+                        .text_alignment(TextAlign::Center)
+                        .line_break_mode(masonry::properties::LineBreaking::WordWrap)
+                        .width(Dim::Stretch),
+                ),
+                checkbox(
+                    "Check me",
+                    data.active,
+                    |data: &mut AppData, checked: bool| {
+                        data.active = checked;
+                    },
+                ),
+                toggleable(data),
+                env_using(),
+                text_button("Decrement", |data: &mut AppData| data.count -= 1),
+                text_button("Reset", |data: &mut AppData| data.count = 0),
+                flex(axis, (fizz_buzz_flex_sequence, flex_sequence)),
+            ))
+            .padding(8.0),
+            // The following `task` view only exists whilst the example is in the "active" state, so
+            // the updates it performs will only be running whilst we are in that state.
+            data.active.then(|| {
+                task(
+                    |proxy, _| async move {
+                        let mut interval = time::interval(Duration::from_secs(1));
+                        loop {
+                            interval.tick().await;
+                            let Ok(()) = proxy.message(()) else {
+                                break;
+                            };
+                        }
+                    },
+                    |data: &mut AppData, ()| {
+                        data.count += 1;
+                    },
+                )
+            }),
+        ),
+    )
+}
+
+fn toggleable(data: &mut AppData) -> impl WidgetView<AppData> + use<> {
+    if data.active {
+        provides(
+            |_| SomeContext(777),
+            flex_row((
+                text_button("Deactivate", |data: &mut AppData| {
+                    data.active = false;
+                }),
+                text_button("Unlimited Power", |data: &mut AppData| {
+                    data.count = -1_000_000;
+                }),
+                without_elements(run_once(|| {
+                    tracing::warn!("The pathway to unlimited power has been revealed");
+                })),
+                env_using(),
+            ))
+            .main_axis_alignment(MainAxisAlignment::Center),
+        )
+        .boxed()
+    } else {
+        text_button("Activate", |data: &mut AppData| data.active = true).boxed()
+    }
+}
+
+struct AppData {
+    text_input_contents: String,
+    count: i32,
+    active: bool,
+    observed_size: Size,
+}
+
+pub(crate) fn run(event_loop: EventLoopBuilder) -> Result<(), EventLoopError> {
+    let data = AppData {
+        count: 0,
+        text_input_contents: "Not quite a placeholder".into(),
+        active: false,
+        observed_size: Size {
+            width: 0.,
+            height: 0.,
+        },
+    };
+
+    Xilem::new_simple(data, app_logic, WindowOptions::new("mason")).run_in(event_loop)
+}
+
+// Boilerplate code: Identical across all applications which support Android
+
+fn main() -> Result<(), EventLoopError> {
+    run(EventLoop::with_user_event())
+}

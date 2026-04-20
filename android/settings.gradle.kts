@@ -19,6 +19,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "ScannerSigantureApp"
+rootProject.name = "XilemGameActivity"
 include(":app")
  
