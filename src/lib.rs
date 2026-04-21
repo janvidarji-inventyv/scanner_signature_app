@@ -6,8 +6,10 @@ use winit::error::EventLoopError;
 // ✅ Everything comes from xilem directly — no masonry_winit imports needed
 use xilem::{
     AnyWidgetView, EventLoopBuilder, WindowOptions, Xilem,
-    view::{flex_col, label, text_button},
+    view::{flex_col, label, text_button, image, sized_box},
 };
+use masonry::properties::types::Length;
+mod image_assets;
 
 enum Screen {
     Info,
@@ -45,23 +47,24 @@ fn app_logic(state: &mut AppState) -> Box<AnyWidgetView<AppState>> {
 }
 
 fn info_screen() -> impl xilem::WidgetView<AppState> {
-    flex_col((
-        label("").text_size(36.0),
-        label("📱").text_size(80.0),
-        label("").text_size(18.0),
+    let icon = image_assets::get_icon().clone();
+        flex_col((
+        label("").text_size(80.0), // Increased top margin
+        sized_box(image(icon)).width(Length::px(120.0)).height(Length::px(120.0)), // Use sized_box for icon size
+        label("").text_size(12.0), // Spacer below icon
         label("Scanner Signature App")
-            .text_size(30.0)
+            .text_size(24.0)
             .weight(xilem::FontWeight::BOLD),
         label("").text_size(10.0),
         label("Scan and verify QR codes for signatures and documents.")
-            .text_size(17.0)
+            .text_size(16.0)
             .text_alignment(xilem::TextAlign::Center),
         label("").text_size(18.0),
         label("• Scan QR codes from paper or screen\n• Secure signature verification\n• Works offline and online\n• Simple, privacy-first design")
             .text_size(15.0)
             .text_alignment(xilem::TextAlign::Start),
         label("").text_size(24.0),
-        text_button("Scan", |s: &mut AppState| {
+        text_button("Scan the QR Code", |s: &mut AppState| {
             s.set_screen(Screen::Scan);
         }),
         label("").text_size(36.0),
@@ -73,7 +76,7 @@ fn scan_screen() -> impl xilem::WidgetView<AppState> {
         label("").text_size(36.0),
         label("📸").text_size(80.0),
         label("").text_size(30.0),
-        label("Scan Screen")
+        label("Scan the QR Code")
             .text_size(30.0)
             .weight(xilem::FontWeight::BOLD),
         label("").text_size(30.0),
