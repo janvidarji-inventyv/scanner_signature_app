@@ -1,0 +1,5 @@
+# Add these dependencies for Android camera and QR scanning support
+ndk-sys = "0.5"
+jni = "0.21"
+ndk-glue = "0.7"
+quircs = "0.10"

@@ -3,6 +3,8 @@ plugins {
     alias(libs.plugins.kotlin.android)
 }
 
+import java.io.File
+
 android {
     namespace = "com.inventyv.xilemgameactivity"
     compileSdk = 36
@@ -17,7 +19,6 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             abiFilters.add("arm64-v8a")
-            abiFilters.add("x86_64")
         }
     }
 
@@ -37,6 +38,27 @@ android {
     kotlinOptions {
         jvmTarget = "11"
     }
+}
+
+val rustTarget = "aarch64-linux-android"
+val rustLibName = "libscanner_signature_app.so"
+val rustProjectDir = rootProject.projectDir.parentFile
+val rustOutputDir = File(rustProjectDir, "target/$rustTarget/debug")
+val androidJniDir = File(projectDir, "src/main/jniLibs/arm64-v8a")
+
+val buildRustLib by tasks.registering(Exec::class) {
+    workingDir = rustProjectDir
+    commandLine("cargo", "build", "--target", rustTarget)
+}
+
+val copyRustLib by tasks.registering(Copy::class) {
+    dependsOn(buildRustLib)
+    from(File(rustOutputDir, rustLibName))
+    into(androidJniDir)
+}
+
+tasks.named("preBuild") {
+    dependsOn(copyRustLib)
 }
 
 dependencies {

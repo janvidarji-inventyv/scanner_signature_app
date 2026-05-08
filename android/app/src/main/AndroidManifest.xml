@@ -30,6 +30,6 @@
        <!--  <activity
             android:name=".MainActivity"
             android:exported="false"/> -->
-    </application>
+   </application>
 
 </manifest>
