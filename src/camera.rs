@@ -66,6 +66,13 @@ pub fn frame_buf() -> &'static Arc<Mutex<Option<CameraFrame>>> {
     FRAME_BUF.get_or_init(|| Arc::new(Mutex::new(None)))
 }
 
+// ── Frame generation counter — incremented each time a new preview is stored ─
+// Widget compares against last-seen gen; skips GPU re-upload when unchanged.
+use std::sync::atomic::AtomicU64;
+static FRAME_GEN: AtomicU64 = AtomicU64::new(0);
+
+pub fn frame_gen() -> u64 { FRAME_GEN.load(Ordering::Relaxed) }
+
 // ── QR result ─────────────────────────────────────────────────────────────────
 //
 // Design: two-phase commit that survives event-loop crashes.
@@ -216,10 +223,16 @@ mod android_impl {
     const AIMAGE_FORMAT_YUV_420_888: i32               = 0x23;
     const ACAMERA_CONTROL_AF_MODE: u32                 = 0x0001_0002;
     const ACAMERA_CONTROL_AF_MODE_CONTINUOUS_VIDEO: u8 = 3;
+    const PERM_PREFS_NAME: &str = "scanner_signature_app_perm";
+    const PERM_PREFS_KEY_LAST_GRANTED: &str = "camera_last_granted";
 
+    // Higher source resolution improves distant QR detection (more pixels per module).
     const W: i32 = 1280;
     const H: i32 = 720;
-    const QR_EVERY: u64 = 4;
+    const PREVIEW_W: u32 = 640;
+    const PREVIEW_H: u32 = 360;
+    const QR_EVERY: u64 = 4;      // send to async QR thread every 4th frame
+    const PREVIEW_EVERY: u64 = 2; // update preview every 2nd frame (~15fps at 30fps camera)
 
     static CAMERA_RUNNING:   AtomicBool  = AtomicBool::new(false);
     static STOP_REQUESTED:   AtomicBool  = AtomicBool::new(false);
@@ -232,12 +245,21 @@ mod android_impl {
     static PERMISSION_WATCHDOG_RUNNING: AtomicBool = AtomicBool::new(false);
     static PERMISSION_REQUESTED_AT_MS: AtomicU64 = AtomicU64::new(0);
     static SHOW_PERMISSION_SETTINGS_POPUP: AtomicBool = AtomicBool::new(false);
+    static PERMISSION_LOG_SEQ: AtomicU64 = AtomicU64::new(0);
 
     // ── Frame-available condvar ───────────────────────────────────────────────
     struct FrameSignal { mutex: Mutex<bool>, cond: Condvar }
 
     static FRAME_SIGNAL: std::sync::OnceLock<Arc<FrameSignal>> =
         std::sync::OnceLock::new();
+
+    // Channel: main loop deposits a Y-plane snapshot here; background QR thread picks it up.
+    static QR_DEC_CHAN: std::sync::OnceLock<Arc<(Mutex<Option<(Vec<u8>, u32, u32)>>, Condvar)>> =
+        std::sync::OnceLock::new();
+
+    fn qr_decode_chan() -> &'static Arc<(Mutex<Option<(Vec<u8>, u32, u32)>>, Condvar)> {
+        QR_DEC_CHAN.get_or_init(|| Arc::new((Mutex::new(None), Condvar::new())))
+    }
 
     fn frame_signal() -> &'static Arc<FrameSignal> {
         FRAME_SIGNAL.get_or_init(|| Arc::new(FrameSignal {
@@ -259,6 +281,75 @@ mod android_impl {
                 Err(_) => false,
             }
         } else { false }
+    }
+
+    // Extract the raw Y-plane from an NDK AImage into an owned Vec<u8>.
+    fn extract_y_plane(image: *mut ffi::AImage, width: u32, height: u32) -> Option<Vec<u8>> {
+        let mut ptr: *mut u8 = std::ptr::null_mut();
+        let mut len: i32 = 0;
+        let st = unsafe { ffi::AImage_getPlaneData(image, 0, &mut ptr, &mut len) };
+        if st != ffi::media_status_t::AMEDIA_OK || ptr.is_null() || len <= 0 { return None; }
+        let mut rs: i32 = width as i32;
+        unsafe { ffi::AImage_getPlaneRowStride(image, 0, &mut rs); }
+        let rs = rs.max(1) as usize;
+        let (w, h) = (width as usize, height as usize);
+        let src = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        if rs == w {
+            if src.len() < w * h { return None; }
+            Some(src[..w * h].to_vec())
+        } else {
+            let needed = h.saturating_sub(1) * rs + w;
+            if src.len() < needed { return None; }
+            Some((0..h).flat_map(|r| src[r * rs..r * rs + w].iter().copied()).collect())
+        }
+    }
+
+    // Send latest frame to QR thread; overwrites older pending frame.
+    fn send_to_qr_thread(y: Vec<u8>, w: u32, h: u32) {
+        let (lock, cvar) = &**qr_decode_chan();
+        if let Ok(mut g) = lock.lock() {
+            *g = Some((y, w, h));
+            cvar.notify_one();
+        }
+    }
+
+    // Spawn a single background thread that decodes QR without ever blocking the camera loop.
+    fn spawn_qr_decode_thread() {
+        let chan = qr_decode_chan().clone();
+        std::thread::Builder::new()
+            .name("qr-decode".into())
+            .spawn(move || {
+                loop {
+                    let frame = {
+                        let (lock, cvar) = &*chan;
+                        let mut g = lock.lock().unwrap_or_else(|e| e.into_inner());
+                        loop {
+                            if STOP_REQUESTED.load(Ordering::SeqCst) { return; }
+                            if g.is_some() { break; }
+                            g = cvar.wait(g).unwrap_or_else(|e| e.into_inner());
+                        }
+                        g.take()
+                    };
+                    if STOP_REQUESTED.load(Ordering::SeqCst) { return; }
+                    if let Some((y, w, h)) = frame {
+                        if let Some(qr) = decode_qr_from_y(&y, w, h) {
+                            QR_FOUND_EXIT.store(true, Ordering::SeqCst);
+                            STOP_REQUESTED.store(true, Ordering::SeqCst);
+                            PERMISSION_PENDING.store(false, Ordering::SeqCst);
+                            store_qr_result(qr);
+                            wakeup_ui();
+                            std::thread::spawn(|| {
+                                for _ in 0..20 {
+                                    wakeup_ui();
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                }
+                            });
+                            return;
+                        }
+                    }
+                }
+            })
+            .ok();
     }
 
     unsafe extern "C" fn on_image_available(
@@ -285,13 +376,130 @@ mod android_impl {
     pub fn init(app: AndroidApp) {
         JAVA_VM_PTR.store(app.vm_as_ptr() as usize, Ordering::SeqCst);
         ACTIVITY_PTR.store(app.activity_as_ptr() as usize, Ordering::SeqCst);
+        log_permission_state("app_start");
+        // No grant mode or revoke-on-kill logic needed
     }
+
+    fn get_last_granted_marker() -> Option<bool> {
+        with_jni(|env, act| {
+            let prefs_name = env.new_string(PERM_PREFS_NAME).ok()?;
+            let prefs = env
+                .call_method(
+                    act,
+                    "getSharedPreferences",
+                    "(Ljava/lang/String;I)Landroid/content/SharedPreferences;",
+                    &[
+                        jni::objects::JValue::Object(&prefs_name.into()),
+                        jni::objects::JValue::Int(0),
+                    ],
+                )
+                .ok()?
+                .l()
+                .ok()?;
+            let key = env.new_string(PERM_PREFS_KEY_LAST_GRANTED).ok()?;
+            let value = env
+                .call_method(
+                    &prefs,
+                    "getBoolean",
+                    "(Ljava/lang/String;Z)Z",
+                    &[
+                        jni::objects::JValue::Object(&key.into()),
+                        jni::objects::JValue::Bool(0),
+                    ],
+                )
+                .ok()?
+                .z()
+                .ok()?;
+            Some(value)
+        })
+    }
+
+    fn set_last_granted_marker(granted: bool) {
+        let _ = with_jni(|env, act| {
+            let prefs_name = env.new_string(PERM_PREFS_NAME).ok()?;
+            let prefs = env
+                .call_method(
+                    act,
+                    "getSharedPreferences",
+                    "(Ljava/lang/String;I)Landroid/content/SharedPreferences;",
+                    &[
+                        jni::objects::JValue::Object(&prefs_name.into()),
+                        jni::objects::JValue::Int(0),
+                    ],
+                )
+                .ok()?
+                .l()
+                .ok()?;
+            let editor = env
+                .call_method(
+                    &prefs,
+                    "edit",
+                    "()Landroid/content/SharedPreferences$Editor;",
+                    &[],
+                )
+                .ok()?
+                .l()
+                .ok()?;
+            let key = env.new_string(PERM_PREFS_KEY_LAST_GRANTED).ok()?;
+            let granted_j = if granted { 1 } else { 0 };
+            env.call_method(
+                &editor,
+                "putBoolean",
+                "(Ljava/lang/String;Z)Landroid/content/SharedPreferences$Editor;",
+                &[
+                    jni::objects::JValue::Object(&key.into()),
+                    jni::objects::JValue::Bool(granted_j),
+                ],
+            )
+            .ok()?;
+            env.call_method(&editor, "apply", "()V", &[]).ok()?;
+            Some(())
+        });
+    }
+
+
+    fn clear_pending_jni_exception(env: &mut jni::JNIEnv, source: &str) {
+        match env.exception_check() {
+            Ok(true) => {
+                let _ = env.exception_describe();
+                let _ = env.exception_clear();
+                log::warn!("[CAM] cleared pending JNI exception at {}", source);
+            }
+            Ok(false) => {}
+            Err(err) => {
+                log::warn!("[CAM] failed to query JNI exception state at {}: {:?}", source, err);
+            }
+        }
+    }
+
+    // schedule_camera_permission_revoke_on_kill removed: not needed
 
     pub fn hide() {
         log::info!("[CAM] hide: signalling stop");
         STOP_REQUESTED.store(true, Ordering::SeqCst);
         signal_frame();
+        // Wake the background QR thread so it can see STOP_REQUESTED and exit cleanly.
+        let (_, cvar) = &**qr_decode_chan();
+        cvar.notify_all();
         if let Ok(mut fb) = frame_buf().lock() { *fb = None; }
+        super::FRAME_GEN.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn reset_runtime_state() {
+        log::warn!("[CAM] reset runtime state after render failure");
+        STOP_REQUESTED.store(true, Ordering::SeqCst);
+        DEV_DISCONNECTED.store(false, Ordering::SeqCst);
+        DEV_ERROR.store(false, Ordering::SeqCst);
+        QR_FOUND_EXIT.store(false, Ordering::SeqCst);
+        PERMISSION_PENDING.store(false, Ordering::SeqCst);
+        PERMISSION_WATCHDOG_RUNNING.store(false, Ordering::SeqCst);
+        signal_frame();
+        let (_, cvar) = &**qr_decode_chan();
+        cvar.notify_all();
+        if let Ok(mut fb) = frame_buf().lock() {
+            *fb = None;
+        }
+        super::FRAME_GEN.fetch_add(1, Ordering::Relaxed);
         CAMERA_RUNNING.store(false, Ordering::SeqCst);
     }
 
@@ -303,6 +511,10 @@ mod android_impl {
             ACTIVITY_PTR.load(Ordering::SeqCst),
             f,
         )
+    }
+
+    pub fn show_overlay() {
+        // Intentionally do not force orientation. Preview transform is adaptive.
     }
 
     fn has_camera_permission() -> bool {
@@ -332,6 +544,63 @@ mod android_impl {
             .unwrap_or(0)
     }
 
+    fn should_show_camera_permission_rationale() -> Option<bool> {
+        with_jni(|env, act| {
+            let p = env.new_string("android.permission.CAMERA").ok()?;
+            let r = env
+                .call_method(
+                    act,
+                    "shouldShowRequestPermissionRationale",
+                    "(Ljava/lang/String;)Z",
+                    &[jni::objects::JValue::Object(&p.into())],
+                )
+                .ok()?
+                .z()
+                .ok()?;
+            Some(r)
+        })
+    }
+
+    fn log_permission_state(source: &str) {
+        let granted = has_camera_permission();
+        let rationale = should_show_camera_permission_rationale();
+        let pending = PERMISSION_PENDING.load(Ordering::SeqCst);
+        let requested_at = PERMISSION_REQUESTED_AT_MS.load(Ordering::SeqCst);
+        let age_ms = if requested_at == 0 {
+            0
+        } else {
+            now_ms().saturating_sub(requested_at)
+        };
+        let seq = PERMISSION_LOG_SEQ.fetch_add(1, Ordering::Relaxed) + 1;
+
+        let verdict = if granted {
+            "GRANTED"
+        } else {
+            match rationale {
+                Some(true) => "DENIED_CAN_ASK_AGAIN",
+                Some(false) => {
+                    if requested_at == 0 {
+                        "NOT_REQUESTED_YET"
+                    } else {
+                        "DENIED_DONT_ASK_AGAIN_OR_FIRST_DECISION"
+                    }
+                }
+                None => "DENIED_RATIONALE_UNKNOWN",
+            }
+        };
+
+        log::info!(
+            "[PERM][{}][{}] verdict={} granted={} rationale={:?} pending={} request_age_ms={}",
+            source,
+            seq,
+            verdict,
+            granted,
+            rationale,
+            pending,
+            age_ms,
+        );
+    }
+
     fn maybe_flag_permission_denied() {
         if !PERMISSION_PENDING.load(Ordering::SeqCst) {
             return;
@@ -345,26 +614,46 @@ mod android_impl {
             return;
         }
 
-        // Wait a bit so we don't race the system permission prompt opening.
-        if now_ms().saturating_sub(requested_at) < 800 {
+        let age_ms = now_ms().saturating_sub(requested_at);
+        let rationale = should_show_camera_permission_rationale();
+        let focus_back = has_window_focus();
+
+        let raise_popup = |age_ms: u64, focus_back: bool, rationale: Option<bool>| {
+            if PERMISSION_PENDING
+                .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+            {
+                return;
+            }
+            log_permission_state("watchdog_denied");
+            log::warn!(
+                "[CAM] permission denied (age_ms={}, focus_back={}, rationale={:?}), showing settings popup",
+                age_ms,
+                focus_back,
+                rationale
+            );
+            SHOW_PERMISSION_SETTINGS_POPUP.store(true, Ordering::SeqCst);
+            wakeup_ui();
+        };
+
+        // Fast path: when rationale=true Android already confirmed a deny
+        // decision with "can ask again", so show popup almost immediately.
+        if matches!(rationale, Some(true)) && age_ms >= 350 {
+            raise_popup(age_ms, focus_back, rationale);
             return;
         }
 
-        // If the system prompt is still visible, activity usually loses focus.
-        if !has_window_focus() {
+        // Conservative path for first decision / dont-ask-again cases.
+        if age_ms < 1200 {
+            return;
+        }
+        // Preferred signal: prompt typically returns focus after user decision.
+        // Fallback: force a decision after a hard timeout on odd devices.
+        if !focus_back && age_ms < 4000 {
             return;
         }
 
-        if PERMISSION_PENDING
-            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-
-        SHOW_PERMISSION_SETTINGS_POPUP.store(true, Ordering::SeqCst);
-        log::info!("[CAM] permission denied -> show settings popup");
-        wakeup_ui();
+        raise_popup(age_ms, focus_back, rationale);
     }
 
     fn request_camera_permission() {
@@ -379,6 +668,7 @@ mod android_impl {
                   jni::objects::JValue::Int(1001)]).ok()?;
             Some(())
         });
+        log_permission_state("request_sent");
     }
 
     fn start_permission_watchdog() {
@@ -393,6 +683,12 @@ mod android_impl {
             // Keep UI waking while permission dialog is open so app_logic gets
             // chances to observe newly granted permission on all Android versions.
             for _ in 0..120 {
+                if !PERMISSION_PENDING.load(Ordering::SeqCst) {
+                    break;
+                }
+                // Resolve denied permission from the watchdog thread too, so
+                // popup flow does not depend solely on app_logic poll cadence.
+                maybe_flag_permission_denied();
                 if !PERMISSION_PENDING.load(Ordering::SeqCst) {
                     break;
                 }
@@ -411,6 +707,7 @@ mod android_impl {
         if !matches!(state.screen, Screen::Info) { return; }
         if qr_result_ready() { return; }
         if !PERMISSION_PENDING.load(Ordering::SeqCst) { return; }
+        log_permission_state("poll_tick");
         if !has_camera_permission() {
             maybe_flag_permission_denied();
             return;
@@ -423,13 +720,15 @@ mod android_impl {
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         { return; }
+        log_permission_state("poll_granted");
+        set_last_granted_marker(true);
         log::info!("[CAM] permission granted (polled) → starting scan");
         state.show_permission_error = false;
         if !qr_result_ready() {
             clear_qr_result();
         }
         state.set_screen(Screen::Scan);
-        start_camera_thread();
+        start_camera_thread_or_retry();
         wakeup_ui();
     }
 
@@ -437,6 +736,7 @@ mod android_impl {
         if !matches!(state.screen, Screen::Info) { return; }
         if qr_result_ready() { return; }
         if !PERMISSION_PENDING.load(Ordering::SeqCst) { return; }
+        log_permission_state("resumed_tick");
         if !has_camera_permission() {
             maybe_flag_permission_denied();
             return;
@@ -449,6 +749,8 @@ mod android_impl {
             .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         { return; }
+        log_permission_state("resumed_granted");
+        set_last_granted_marker(true);
         log::info!("[CAM] permission granted (resumed) → starting scan");
         state.show_permission_error = false;
         if !qr_result_ready() {
@@ -456,26 +758,69 @@ mod android_impl {
         }
         state.set_screen(Screen::Scan);
         std::thread::spawn(|| {
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        start_camera_thread();
-        wakeup_ui();
-    });
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            start_camera_thread_or_retry();
+            wakeup_ui();
+        });
     }
 
     pub fn scan_button(state: &mut AppState) {
-        PERMISSION_PENDING.store(false, Ordering::SeqCst);
-        if !has_camera_permission() {
-            request_camera_permission();
-            PERMISSION_REQUESTED_AT_MS.store(now_ms(), Ordering::SeqCst);
-            PERMISSION_PENDING.store(true, Ordering::SeqCst);
-            start_permission_watchdog();
-            state.show_permission_error = false;
+        if state.show_permission_popup {
+            log::info!("[CAM] scan_button ignored: permission popup already visible");
+            wakeup_ui();
             return;
         }
-        clear_qr_result();
-        state.set_screen(Screen::Scan);
-        start_camera_thread();
+        if PERMISSION_PENDING.load(Ordering::SeqCst) {
+            log::info!("[CAM] scan_button ignored: permission request already pending");
+            wakeup_ui();
+            return;
+        }
+        if SHOW_PERMISSION_SETTINGS_POPUP.load(Ordering::SeqCst) {
+            log::info!("[CAM] scan_button ignored: permission popup request pending");
+            wakeup_ui();
+            return;
+        }
+
+        if has_camera_permission() {
+            log_permission_state("scan_button_already_granted");
+            set_last_granted_marker(true);
+            state.show_permission_error = false;
+            if !qr_result_ready() {
+                clear_qr_result();
+            }
+            state.set_screen(Screen::Scan);
+            start_camera_thread_or_retry();
+            wakeup_ui();
+            return;
+        }
+
+        log_permission_state("scan_button_before_request");
+        request_camera_permission();
+        PERMISSION_REQUESTED_AT_MS.store(now_ms(), Ordering::SeqCst);
+        PERMISSION_PENDING.store(true, Ordering::SeqCst);
+        log_permission_state("scan_button_after_request");
+        start_permission_watchdog();
+        state.show_permission_error = false;
         wakeup_ui();
+    }
+
+    fn start_camera_thread_or_retry() {
+        if CAMERA_RUNNING.load(Ordering::SeqCst) {
+            log::info!("[CAM] previous session still shutting down, retrying start shortly");
+            std::thread::spawn(|| {
+                for _ in 0..20 {
+                    if !CAMERA_RUNNING.load(Ordering::SeqCst) {
+                        start_camera_thread();
+                        wakeup_ui();
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                log::warn!("[CAM] camera session did not stop in time for restart");
+            });
+            return;
+        }
+        start_camera_thread();
     }
 
     pub fn take_permission_settings_popup_request() -> bool {
@@ -548,15 +893,8 @@ mod android_impl {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            log::warn!("[CAM] CAMERA_RUNNING still set — force clearing");
-            CAMERA_RUNNING.store(false, Ordering::SeqCst);
-            if CAMERA_RUNNING
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                log::error!("[CAM] aborting spawn");
-                return;
-            }
+            log::warn!("[CAM] camera thread already running; skipping spawn");
+            return;
         }
 
         log::info!("[CAM] spawning camera thread");
@@ -693,6 +1031,7 @@ mod android_impl {
         }
         log::info!("[CAM] capture started seq={seq_id}");
         wakeup_ui();
+        spawn_qr_decode_thread();
 
         let mut total: u64 = 0;
 
@@ -727,37 +1066,34 @@ mod android_impl {
             total += 1;
             if total == 1 { log::info!("[CAM] first frame {}x{}", img_w, img_h); }
 
-            // ── QR decode every QR_EVERY frames ──────────────────────────────
-            if total % QR_EVERY == 0 {
-                if let Some(qr) = decode_qr(image, img_w as u32, img_h as u32) {
-                    log::info!("[CAM] QR found: {qr}");
-                    unsafe { ffi::AImage_delete(image); }
+            // ── QR and preview run independently — QR is fully async ─────────
+            // Since QR decode happens on a background thread, we can do both
+            // on the same frame without blocking the camera loop.
+            let do_qr      = total % QR_EVERY == 0;
+            let do_preview = total == 1 || total % PREVIEW_EVERY == 0;
 
-                    QR_FOUND_EXIT.store(true, Ordering::SeqCst);
-                    STOP_REQUESTED.store(true, Ordering::SeqCst);
-                    PERMISSION_PENDING.store(false, Ordering::SeqCst);
-                    store_qr_result(qr);
-                    // Trigger multiple wakeups to survive devices where a
-                    // single wake is occasionally dropped around camera teardown.
-                    wakeup_ui();
-                    std::thread::spawn(|| {
-                        for _ in 0..20 {
-                            wakeup_ui();
-                            std::thread::sleep(std::time::Duration::from_millis(50));
-                        }
-                    });
-                    return Ok(());
+            if do_qr {
+                // Non-blocking: extract Y plane and hand to background QR thread.
+                if let Some(y) = extract_y_plane(image, img_w as u32, img_h as u32) {
+                    send_to_qr_thread(y, img_w as u32, img_h as u32);
                 }
             }
-
-            // ── YUV → RGBA → frame buffer ─────────────────────────────────────
-            if let Some(rgba) = yuv_to_rgba(image, img_w as u32, img_h as u32) {
-                if let Ok(mut fb) = frame_buf().lock() {
-                    *fb = Some(CameraFrame {
-                        rgba, width: img_w as u32, height: img_h as u32,
-                    });
+            if do_preview {
+                if let Some(rgba) = yuv_to_preview_rgba(
+                    image,
+                    img_w as u32,
+                    img_h as u32,
+                    PREVIEW_W,
+                    PREVIEW_H,
+                ) {
+                    if let Ok(mut fb) = frame_buf().lock() {
+                        *fb = Some(CameraFrame {
+                            rgba, width: PREVIEW_W, height: PREVIEW_H,
+                        });
+                    }
+                    super::FRAME_GEN.fetch_add(1, Ordering::Relaxed);
+                    wakeup_ui();
                 }
-                wakeup_ui();
             }
 
             unsafe { ffi::AImage_delete(image); }
@@ -767,14 +1103,21 @@ mod android_impl {
         Ok(())
     }
 
-    fn yuv_to_rgba(image: *mut ffi::AImage, width: u32, height: u32) -> Option<Vec<u8>> {
-        let (w, h) = (width as usize, height as usize);
-
+    // Low-cost color preview path: downsample while converting YUV420 to RGBA.
+    // This restores a normal color camera view without doing a full-resolution
+    // conversion on the camera thread.
+    fn yuv_to_preview_rgba(
+        image: *mut ffi::AImage,
+        src_w: u32,
+        src_h: u32,
+        dst_w: u32,
+        dst_h: u32,
+    ) -> Option<Vec<u8>> {
         macro_rules! plane {
-            ($idx:expr) => {{
+            ($idx:expr, $default_row_stride:expr) => {{
                 let mut ptr: *mut u8 = std::ptr::null_mut();
-                let mut len: i32     = 0;
-                let mut rs: i32 = width as i32;
+                let mut len: i32 = 0;
+                let mut rs: i32 = $default_row_stride as i32;
                 let mut ps: i32 = 1;
                 unsafe {
                     let st = ffi::AImage_getPlaneData(image, $idx, &mut ptr, &mut len);
@@ -783,62 +1126,53 @@ mod android_impl {
                     ffi::AImage_getPlanePixelStride(image, $idx, &mut ps);
                 }
                 if ptr.is_null() || len <= 0 { return None; }
-                (unsafe { std::slice::from_raw_parts(ptr, len as usize) },
-                 rs.max(1) as usize, ps.max(1) as usize)
+                (
+                    unsafe { std::slice::from_raw_parts(ptr, len as usize) },
+                    rs.max(1) as usize,
+                    ps.max(1) as usize,
+                )
             }};
         }
 
-        let (y_d, y_rs, y_ps) = plane!(0);
-        let (u_d, u_rs, u_ps) = plane!(1);
-        let (v_d, v_rs, v_ps) = plane!(2);
+        let (y_d, y_rs, y_ps) = plane!(0, src_w);
+        let (u_d, u_rs, u_ps) = plane!(1, src_w / 2);
+        let (v_d, v_rs, v_ps) = plane!(2, src_w / 2);
 
-        let mut out = vec![255u8; w * h * 4];
-        for row in 0..h {
-            let uv_row = row >> 1;
-            for col in 0..w {
-                let uv_col = col >> 1;
-                let yi = row    * y_rs + col    * y_ps;
-                let ui = uv_row * u_rs + uv_col * u_ps;
-                let vi = uv_row * v_rs + uv_col * v_ps;
-                if yi >= y_d.len() || ui >= u_d.len() || vi >= v_d.len() { continue; }
-                let y = y_d[yi] as i32;
+        let mut out = vec![255u8; (dst_w * dst_h * 4) as usize];
+        for y in 0..dst_h {
+            let sy = (y * src_h / dst_h) as usize;
+            let uv_row = (sy / 2) as usize;
+            for x in 0..dst_w {
+                let sx = (x * src_w / dst_w) as usize;
+                let uv_col = (sx / 2) as usize;
+                let yi = sy.saturating_mul(y_rs).saturating_add(sx.saturating_mul(y_ps));
+                let ui = uv_row.saturating_mul(u_rs).saturating_add(uv_col.saturating_mul(u_ps));
+                let vi = uv_row.saturating_mul(v_rs).saturating_add(uv_col.saturating_mul(v_ps));
+                if yi >= y_d.len() || ui >= u_d.len() || vi >= v_d.len() {
+                    continue;
+                }
+                let luma = y_d[yi] as i32;
                 let u = u_d[ui] as i32 - 128;
                 let v = v_d[vi] as i32 - 128;
-                let r = (y * 1000 + 1402 * v) / 1000;
-                let g = (y * 1000 - 344  * u - 714 * v) / 1000;
-                let b = (y * 1000 + 1772 * u) / 1000;
-                let i = (row * w + col) * 4;
-                out[i]     = r.clamp(0, 255) as u8;
-                out[i + 1] = g.clamp(0, 255) as u8;
-                out[i + 2] = b.clamp(0, 255) as u8;
+                let r = (luma + (v * 359 >> 8)).clamp(0, 255) as u8;
+                let g = (luma - (u * 88 >> 8) - (v * 183 >> 8)).clamp(0, 255) as u8;
+                let b = (luma + (u * 454 >> 8)).clamp(0, 255) as u8;
+                let di = ((y * dst_w + x) * 4) as usize;
+                out[di] = r;
+                out[di + 1] = g;
+                out[di + 2] = b;
             }
         }
         Some(out)
     }
 
-    fn decode_qr(image: *mut ffi::AImage, width: u32, height: u32) -> Option<String> {
-        let mut ptr: *mut u8 = std::ptr::null_mut();
-        let mut len: i32     = 0;
-        let st = unsafe { ffi::AImage_getPlaneData(image, 0, &mut ptr, &mut len) };
-        if st != ffi::media_status_t::AMEDIA_OK || ptr.is_null() || len <= 0 { return None; }
+    // Decode QR from a raw Y-plane buffer.
+    // Prefer reliability here: run on full frame, then try a rotated fallback.
+    fn decode_qr_from_y(y: &[u8], width: u32, height: u32) -> Option<String> {
+        let w = width as usize;
+        let h = height as usize;
 
-        let mut row_stride: i32 = width as i32;
-        unsafe { ffi::AImage_getPlaneRowStride(image, 0, &mut row_stride); }
-        let rs = row_stride.max(1) as usize;
-        let (w, h) = (width as usize, height as usize);
-        let src = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-
-        let y: Vec<u8> = if rs == w {
-            if src.len() < w * h { return None; }
-            src[..w * h].to_vec()
-        } else {
-            let needed = h.saturating_sub(1) * rs + w;
-            if src.len() < needed { return None; }
-            (0..h).flat_map(|r| src[r * rs..r * rs + w].iter().copied()).collect()
-        };
-
-        // Try 1: landscape 1280×720
-        if let Some(gray) = image::GrayImage::from_raw(width, height, y.clone()) {
+        if let Some(gray) = image::GrayImage::from_raw(width, height, y.to_vec()) {
             let mut p = rqrr::PreparedImage::prepare(gray);
             for grid in p.detect_grids() {
                 if let Ok((_, s)) = grid.decode() {
@@ -847,14 +1181,14 @@ mod android_impl {
             }
         }
 
-        // Try 2: 90° CCW → portrait 720×1280
+        // 90 deg CCW fallback for devices/orientations where first pass misses.
         let mut portrait = vec![0u8; w * h];
         for row in 0..h {
             for col in 0..w {
                 portrait[col * h + (h - 1 - row)] = y[row * w + col];
             }
         }
-        if let Some(gray) = image::GrayImage::from_raw(height as u32, width as u32, portrait) {
+        if let Some(gray) = image::GrayImage::from_raw(height, width, portrait) {
             let mut p = rqrr::PreparedImage::prepare(gray);
             for grid in p.detect_grids() {
                 if let Ok((_, s)) = grid.decode() {
@@ -953,12 +1287,23 @@ pub fn init_android_app(app: android_activity::AndroidApp) {
     android_impl::init(app);
 }
 
+#[cfg(target_os = "android")]
+pub fn reset_runtime_state() {
+    android_impl::reset_runtime_state();
+}
+
 #[cfg(not(target_os = "android"))]
 pub fn init_android_app(_app: ()) {
     // no-op on desktop
 }
 
-pub fn show_camera_overlay() {}   // no-op both platforms
+#[cfg(not(target_os = "android"))]
+pub fn reset_runtime_state() {}
+
+pub fn show_camera_overlay() {
+    #[cfg(target_os = "android")]      { android_impl::show_overlay(); }
+    #[cfg(not(target_os = "android"))] {}
+}
 
 pub fn hide_camera_overlay() {
     #[cfg(target_os = "android")]      { android_impl::hide(); }

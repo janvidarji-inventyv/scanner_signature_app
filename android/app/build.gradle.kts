@@ -43,12 +43,12 @@ android {
 val rustTarget = "aarch64-linux-android"
 val rustLibName = "libscanner_signature_app.so"
 val rustProjectDir = rootProject.projectDir.parentFile
-val rustOutputDir = File(rustProjectDir, "target/$rustTarget/debug")
+val rustOutputDir = File(rustProjectDir, "target/$rustTarget/release")
 val androidJniDir = File(projectDir, "src/main/jniLibs/arm64-v8a")
 
 val buildRustLib by tasks.registering(Exec::class) {
     workingDir = rustProjectDir
-    commandLine("cargo", "build", "--target", rustTarget)
+    commandLine("cargo", "build", "--release", "--target", rustTarget)
 }
 
 val copyRustLib by tasks.registering(Copy::class) {

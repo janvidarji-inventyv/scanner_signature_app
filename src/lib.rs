@@ -8,7 +8,7 @@ use std::sync::Once;
 
 use xilem::{
     AnyWidgetView, EventLoopBuilder, WindowOptions, Xilem,
-    view::{FlexSpacer, flex_col, flex_row, image, label, sized_box, text_button, zstack},
+    view::{FlexSpacer, button, flex_col, flex_row, image, label, sized_box, text_button, zstack},
 };
 use xilem::core::one_of::Either;
 use masonry::peniko::Color;
@@ -83,10 +83,12 @@ impl AppState {
                 qr_pending:            false, // already committed via peek path
             };
         }
+        let show_permission_popup = camera::take_permission_settings_popup_request();
+
         Self {
             screen:                Screen::Info,
             show_permission_error: false,
-            show_permission_popup: false,
+            show_permission_popup,
             is_scanning:           Arc::new(AtomicBool::new(false)),
             qr_result:             None,
             qr_pending:            false,
@@ -376,10 +378,14 @@ fn info_screen(state: &mut AppState) -> impl xilem::WidgetView<AppState> {
     .background(xilem::style::Background::Color(Color::WHITE));
 
     if state.show_permission_popup {
-        Either::A(zstack((
-            base,
-            permission_required_popup(),
-        )))
+        Either::A(
+            sized_box(zstack((
+                base,
+                permission_required_popup(),
+            )))
+            .expand_width()
+            .expand_height()
+        )
     } else {
         Either::B(base)
     }
@@ -392,9 +398,14 @@ fn permission_required_popup() -> impl xilem::WidgetView<AppState> {
     let dim = Color::from_rgba8(0, 0, 0, 150);
     let light_btn = Color::from_rgba8(231, 235, 238, 255);
 
-    let cancel_btn = text_button("Cancel", |s: &mut AppState| {
-        s.show_permission_popup = false;
-    })
+    let cancel_btn = button(
+        label("Cancel")
+            .text_size(16.0)
+            .color(black),
+        |s: &mut AppState| {
+            s.show_permission_popup = false;
+        }
+    )
     .background(xilem::style::Background::Color(light_btn))
     .corner_radius(22.0)
     .border_color(Color::TRANSPARENT);
@@ -409,26 +420,33 @@ fn permission_required_popup() -> impl xilem::WidgetView<AppState> {
 
     let card = sized_box(
         flex_col((
+            label("").text_size(2.0),
             label("Permission Required")
                 .text_size(22.0)
                 .weight(xilem::FontWeight::BOLD)
                 .text_alignment(xilem::TextAlign::Center)
                 .color(black),
-            label("").text_size(10.0),
-            label("The camera permission is necessary for using this application.")
+            // Force wrapping by splitting into multiple short labels
+            label("The camera permission is necessary")
                 .text_size(14.0)
                 .text_alignment(xilem::TextAlign::Center)
                 .color(gray),
-            label("To proceed, please grant the permission in app settings.")
+            label("for using this application.")
                 .text_size(14.0)
                 .text_alignment(xilem::TextAlign::Center)
                 .color(gray),
-            label("").text_size(18.0),
+            label("To proceed, please grant the permission")
+                .text_size(14.0)
+                .text_alignment(xilem::TextAlign::Center)
+                .color(gray),
+            label("in app settings.")
+                .text_size(14.0)
+                .text_alignment(xilem::TextAlign::Center)
+                .color(gray),
             flex_row((
                 sized_box(cancel_btn)
                     .width(Length::px(130.0))
                     .height(Length::px(44.0)),
-                label("  ").text_size(10.0),
                 sized_box(settings_btn)
                     .width(Length::px(150.0))
                     .height(Length::px(44.0)),
@@ -440,13 +458,15 @@ fn permission_required_popup() -> impl xilem::WidgetView<AppState> {
     )
     .width(Length::px(340.0));
 
-    zstack((
+    sized_box(zstack((
         sized_box(label(""))
             .expand_width()
             .expand_height()
             .background(xilem::style::Background::Color(dim)),
         card,
-    ))
+    )))
+    .expand_width()
+    .expand_height()
 }
 
 // ── Success screen ────────────────────────────────────────────────────────────
@@ -730,6 +750,7 @@ pub extern "C" fn android_main(app: android_activity::AndroidApp) {
             Ok(Ok(())) => { break; }
             Ok(Err(e)) => {
                 let msg = e.to_string();
+                camera::reset_runtime_state();
                 if msg.contains("can't be recreated") || msg.contains("EventLoop") {
                     wait_for_android_resume(&app);
                 } else {
@@ -739,6 +760,7 @@ pub extern "C" fn android_main(app: android_activity::AndroidApp) {
             }
             Err(_) => {
                 log::error!("\u{274C} Panic in event loop");
+                camera::reset_runtime_state();
                 wait_for_android_resume(&app);
             }
         }

@@ -59,10 +59,10 @@ ndk = { version = "0.9", features = ["media", "api-level-24", "nativewindow"] }
 opt-level     = 3
 lto           = true
 codegen-units = 1
-panic         = "abort"
+panic         = "unwind"
 
 [profile.dev]
-opt-level = 0
+opt-level = 2
 
 [patch.crates-io]
 masonry_core = { path = "vendor/masonry_core-0.4.0" }
