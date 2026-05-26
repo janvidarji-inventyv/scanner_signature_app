@@ -182,6 +182,18 @@ pub fn init_wakeup_pipe(_app: &()) {}
 #[cfg(not(target_os = "android"))]
 pub fn wakeup_ui() {}
 
+#[cfg(target_os = "android")]
+pub fn app_internal_data_path() -> Option<std::path::PathBuf> {
+    ANDROID_APP_FOR_WAKER
+        .get()
+        .and_then(|app| app.internal_data_path())
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn app_internal_data_path() -> Option<std::path::PathBuf> {
+    std::env::current_dir().ok()
+}
+
 // ── JNI helper ────────────────────────────────────────────────────────────────
 #[cfg(target_os = "android")]
 fn with_jni_raw<T, F>(vm_ptr: usize, act_ptr: usize, f: F) -> Option<T>
@@ -883,6 +895,36 @@ mod android_impl {
         });
     }
 
+    pub fn set_landscape_orientation() {
+        // android.content.pm.ActivityInfo.SCREEN_ORIENTATION_LANDSCAPE = 0
+        const SCREEN_ORIENTATION_LANDSCAPE: i32 = 0;
+        let _ = with_jni(|env, act| {
+            env.call_method(
+                act,
+                "setRequestedOrientation",
+                "(I)V",
+                &[jni::objects::JValue::Int(SCREEN_ORIENTATION_LANDSCAPE)],
+            )
+            .ok()?;
+            Some(())
+        });
+    }
+
+    pub fn set_portrait_orientation() {
+        // android.content.pm.ActivityInfo.SCREEN_ORIENTATION_PORTRAIT = 1
+        const SCREEN_ORIENTATION_PORTRAIT: i32 = 1;
+        let _ = with_jni(|env, act| {
+            env.call_method(
+                act,
+                "setRequestedOrientation",
+                "(I)V",
+                &[jni::objects::JValue::Int(SCREEN_ORIENTATION_PORTRAIT)],
+            )
+            .ok()?;
+            Some(())
+        });
+    }
+
     fn start_camera_thread() {
         STOP_REQUESTED.store(false, Ordering::SeqCst);
         DEV_DISCONNECTED.store(false, Ordering::SeqCst);
@@ -1266,6 +1308,8 @@ mod desktop_impl {
     pub fn on_resumed(_: &mut AppState) {}
     pub fn take_permission_settings_popup_request() -> bool { false }
     pub fn open_app_settings() {}
+    pub fn set_landscape_orientation() {}
+    pub fn set_portrait_orientation() {}
     pub fn scan_button(state: &mut AppState) {
         clear_qr_result();
         state.set_screen(Screen::Scan);
@@ -1333,4 +1377,14 @@ pub fn take_permission_settings_popup_request() -> bool {
 pub fn open_app_settings() {
     #[cfg(target_os = "android")]      { android_impl::open_app_settings(); }
     #[cfg(not(target_os = "android"))] { desktop_impl::open_app_settings(); }
+}
+
+pub fn set_landscape_orientation() {
+    #[cfg(target_os = "android")]      { android_impl::set_landscape_orientation(); }
+    #[cfg(not(target_os = "android"))] { desktop_impl::set_landscape_orientation(); }
+}
+
+pub fn set_portrait_orientation() {
+    #[cfg(target_os = "android")]      { android_impl::set_portrait_orientation(); }
+    #[cfg(not(target_os = "android"))] { desktop_impl::set_portrait_orientation(); }
 }

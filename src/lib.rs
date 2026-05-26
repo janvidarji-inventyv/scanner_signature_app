@@ -2,7 +2,9 @@
 use winit::error::EventLoopError;
 use xilem::view::ZStackExt;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "android")]
 use std::sync::Once;
 
@@ -14,12 +16,16 @@ use xilem::core::one_of::Either;
 use masonry::peniko::Color;
 use masonry::properties::types::Length;
 use xilem::style::Style;
+use image::{ImageBuffer, Rgba};
+use kurbo::Point;
 
 mod image_assets;
 mod camera;
 mod camera_widget;
+mod signature_pad_widget;
 
 use camera_widget::camera_view;
+use signature_pad_widget::{notify_signature_pad_changed, signature_pad_view, SignaturePadState};
 
 #[cfg(target_os = "android")]
 static TRACING_INIT: Once = Once::new();
@@ -49,6 +55,16 @@ pub enum Screen {
     Info,
     Scan,
     Success,
+    SignatureCapture,
+    SignaturePad,
+    SignaturePreview,
+    SignatureSaved,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ScanMode {
+    Activation,
+    SignatureCapture,
 }
 
 pub struct AppState {
@@ -60,6 +76,9 @@ pub struct AppState {
     // ── FIX: explicit flag set by QR detection so app_logic always
     //    transitions even if the anim-loop wakeup arrives late ──────────
     pub qr_pending:            bool,
+    pub scan_mode:             ScanMode,
+    pub signature_pad:         Arc<Mutex<SignaturePadState>>,
+    pub signature_save_message: Option<String>,
 }
 
 impl AppState {
@@ -81,6 +100,9 @@ impl AppState {
                 is_scanning:           Arc::new(AtomicBool::new(false)),
                 qr_result:             qr,
                 qr_pending:            false, // already committed via peek path
+                scan_mode:             ScanMode::Activation,
+                signature_pad:         Arc::new(Mutex::new(SignaturePadState { strokes: Vec::new(), can_draw: true, canvas_size: (0.0, 0.0) })),
+                signature_save_message: None,
             };
         }
         let show_permission_popup = camera::take_permission_settings_popup_request();
@@ -92,6 +114,9 @@ impl AppState {
             is_scanning:           Arc::new(AtomicBool::new(false)),
             qr_result:             None,
             qr_pending:            false,
+            scan_mode:             ScanMode::Activation,
+            signature_pad:         Arc::new(Mutex::new(SignaturePadState { strokes: Vec::new(), can_draw: true, canvas_size: (0.0, 0.0) })),
+            signature_save_message: None,
         }
     }
 
@@ -132,12 +157,20 @@ fn app_logic(state: &mut AppState) -> Box<AnyWidgetView<AppState>> {
                 state.qr_result = camera::peek_qr_result();
             }
             if state.qr_result.is_some() {
-                log::info!("[UI] COMMIT Scan->Success");
+                let next_screen = match state.scan_mode {
+                    ScanMode::Activation       => Screen::Success,
+                    ScanMode::SignatureCapture => Screen::SignatureCapture,
+                };
+                log::info!("[UI] COMMIT Scan->{:?}", next_screen);
                 state.qr_pending = false;
-                state.set_screen(Screen::Success);
+                state.set_screen(next_screen);
                 camera::consume_qr_result();
                 camera::wakeup_ui();
-                return Box::new(success_screen(state));
+                return match state.screen {
+                    Screen::Success          => Box::new(success_screen(state)),
+                    Screen::SignatureCapture => Box::new(signature_capture_screen(state)),
+                    _                        => Box::new(info_screen(state)),
+                };
             }
         }
     }
@@ -175,23 +208,106 @@ fn app_logic(state: &mut AppState) -> Box<AnyWidgetView<AppState>> {
     // Separated from the poll above to avoid re-entrancy:
     // set_screen → hide_camera_overlay() modifies camera globals.
     if state.qr_pending && state.qr_result.is_some() {
-        log::info!("[UI] transitioning to Success screen");
+        let next_screen = match state.scan_mode {
+            ScanMode::Activation        => Screen::Success,
+            ScanMode::SignatureCapture  => Screen::SignatureCapture,
+        };
+        log::info!("[UI] transitioning to {:?} screen", next_screen);
         state.qr_pending = false;
-        state.set_screen(Screen::Success);
-        // NOW it is safe to consume: set_screen(Success) completed,
-        // so even if wgpu panics immediately after this point, AppState::new()
-        // on restart will see screen=Success and qr_result already in state.
-        // (Actually on restart AppState is recreated — but qr_result_ready()
-        // will still be true until consume runs, so new() recovers correctly.)
+        state.set_screen(next_screen);
         camera::consume_qr_result();
         camera::wakeup_ui();
     }
 
     match state.screen {
-        Screen::Info    => Box::new(info_screen(state)),
-        Screen::Scan    => Box::new(scan_screen(state)),
-        Screen::Success => Box::new(success_screen(state)),
+        Screen::Info               => Box::new(info_screen(state)),
+        Screen::Scan               => Box::new(scan_screen(state)),
+        Screen::Success            => Box::new(success_screen(state)),
+        Screen::SignatureCapture   => Box::new(signature_capture_screen(state)),
+        Screen::SignaturePad       => Box::new(signature_pad_screen(state)),
+        Screen::SignaturePreview   => Box::new(signature_preview_screen(state)),
+        Screen::SignatureSaved     => Box::new(signature_saved_screen(state)),
     }
+}
+
+fn draw_line_rgba(
+    img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: Rgba<u8>,
+) {
+    let mut x = x0;
+    let mut y = y0;
+    let dx = (x1 - x0).abs();
+    let dy = -(y1 - y0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        if x >= 0 && y >= 0 && (x as u32) < img.width() && (y as u32) < img.height() {
+            img.put_pixel(x as u32, y as u32, color);
+        }
+        if x == x1 && y == y1 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y += sy;
+        }
+    }
+}
+
+fn save_signature_png(state: &AppState) -> Result<String, String> {
+    let (strokes, canvas_size): (Vec<Vec<Point>>, (f64, f64)) = {
+        let pad = state
+            .signature_pad
+            .lock()
+            .map_err(|_| "failed to lock signature pad".to_string())?;
+        (pad.strokes.clone(), pad.canvas_size)
+    };
+
+    if !strokes.iter().any(|s| !s.is_empty()) {
+        return Err("no signature to save".to_string());
+    }
+
+    let width = canvas_size.0.max(1.0) as u32;
+    let height = canvas_size.1.max(1.0) as u32;
+    let mut img = ImageBuffer::from_pixel(width, height, Rgba([255, 255, 255, 255]));
+    let ink = Rgba([20, 20, 20, 255]);
+
+    for stroke in &strokes {
+        if stroke.len() < 2 {
+            continue;
+        }
+        for pair in stroke.windows(2) {
+            let p0 = pair[0];
+            let p1 = pair[1];
+            draw_line_rgba(&mut img, p0.x as i32, p0.y as i32, p1.x as i32, p1.y as i32, ink);
+        }
+    }
+
+    let base_dir = camera::app_internal_data_path()
+        .ok_or_else(|| "app storage path unavailable".to_string())?;
+    let sig_dir = base_dir.join("signatures");
+    std::fs::create_dir_all(&sig_dir).map_err(|e| format!("create dir failed: {e}"))?;
+
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|e| format!("time error: {e}"))?
+        .as_secs();
+    let file_path = sig_dir.join(format!("signature_{ts}.png"));
+    img.save(&file_path)
+        .map_err(|e| format!("save failed: {e}"))?;
+
+    Ok(file_path.display().to_string())
 }
 
 // ── Scan screen ───────────────────────────────────────────────────────────────
@@ -619,10 +735,11 @@ fn success_screen(_state: &AppState) -> impl xilem::WidgetView<AppState> {
 
     // ── Button ────────────────────────────────────────────────────────────────
     let btn = text_button("CAPTURE SIGNATURE", |s: &mut AppState| {
-        camera::consume_qr_result();
-        s.set_screen(Screen::Info);
         s.qr_result = None;
         s.qr_pending = false;
+        camera::clear_qr_result();
+        s.scan_mode = ScanMode::SignatureCapture;
+        camera::handle_scan_button(s);
     })
     .background(xilem::style::Background::Color(teal))
     .corner_radius(26.0)
@@ -647,6 +764,335 @@ fn success_screen(_state: &AppState) -> impl xilem::WidgetView<AppState> {
             steps,
             FlexSpacer::Flex(1.0),
             bottom,
+        ))
+    )
+    .expand_width()
+    .expand_height()
+    .background(xilem::style::Background::Color(Color::WHITE))
+}
+
+// ── Signature Capture Result screen ──────────────────────────────────────────
+fn signature_capture_screen(state: &mut AppState) -> impl xilem::WidgetView<AppState> {
+    let gray  = Color::from_rgba8(116, 122, 123, 255);
+    let black = Color::from_rgba8(0, 0, 0, 255);
+    let teal  = Color::from_rgba8(0, 80, 116, 255);
+
+    let icon = image_assets::get_signature_icon().clone();
+
+    let center_content = flex_row((
+        FlexSpacer::Flex(1.0),
+        flex_col((
+            sized_box(image(icon))
+                .width(Length::px(150.0))
+                .height(Length::px(150.0)),
+            label("Capture Signature For Taxpayer")
+                .text_size(24.0)
+                .text_alignment(xilem::TextAlign::Center)
+                .color(gray),
+            label("")
+                .text_size(25.0),
+            sized_box(label(" "))
+                .width(Length::px(210.0))
+                .height(Length::px(1.0))
+                .background(xilem::style::Background::Color(black)),
+        )),
+        FlexSpacer::Flex(1.0),
+    ));
+
+    let btn = text_button("DRAW SIGNATURE", |s: &mut AppState| {
+        if let Ok(mut pad) = s.signature_pad.lock() {
+            pad.strokes.clear();
+            pad.can_draw = true;
+        }
+        camera::set_landscape_orientation();
+        s.set_screen(Screen::SignaturePad);
+    })
+    .background(xilem::style::Background::Color(teal))
+    .corner_radius(26.0)
+    .border_color(Color::TRANSPARENT);
+
+    let bottom = flex_col((
+        label("").text_size(14.0),
+        flex_row((
+            FlexSpacer::Flex(1.0),
+            sized_box(btn)
+                .width(Length::px(320.0))
+                .height(Length::px(52.0)),
+            FlexSpacer::Flex(1.0),
+        )),
+        label("").text_size(16.0),
+    ));
+
+    sized_box(
+        flex_col((
+            FlexSpacer::Flex(1.5),
+            center_content,
+            FlexSpacer::Flex(1.0),
+            bottom,
+        ))
+    )
+    .expand_width()
+    .expand_height()
+    .background(xilem::style::Background::Color(Color::WHITE))
+}
+
+fn signature_pad_screen(state: &mut AppState) -> impl xilem::WidgetView<AppState> {
+    let teal = Color::from_rgba8(0, 80, 116, 255);
+    let black = Color::from_rgba8(0, 0, 0, 255);
+
+    let pad = sized_box(signature_pad_view(Arc::clone(&state.signature_pad)))
+        .expand_width()
+        .expand_height();
+
+    let clear_btn = text_button("CLEAR", |s: &mut AppState| {
+        if let Ok(mut pad) = s.signature_pad.lock() {
+            pad.strokes.clear();
+            pad.can_draw = true;
+        }
+        notify_signature_pad_changed();
+        camera::wakeup_ui();
+    })
+    .background(xilem::style::Background::Color(teal))
+    .corner_radius(22.0)
+    .border_color(Color::TRANSPARENT);
+
+    let cancel_btn = text_button("CANCEL", |s: &mut AppState| {
+        if let Ok(mut pad) = s.signature_pad.lock() {
+            pad.strokes.clear();
+            pad.can_draw = true;
+        }
+        camera::set_portrait_orientation();
+        s.set_screen(Screen::SignatureCapture);
+    })
+    .background(xilem::style::Background::Color(teal))
+    .corner_radius(22.0)
+    .border_color(Color::TRANSPARENT);
+
+    let accept_btn = text_button("ACCEPT", |s: &mut AppState| {
+        let has_signature = if let Ok(pad) = s.signature_pad.lock() {
+            pad.strokes.iter().any(|stroke| !stroke.is_empty())
+        } else {
+            false
+        };
+
+        if !has_signature {
+            return;
+        }
+
+        if let Ok(mut pad) = s.signature_pad.lock() {
+            pad.can_draw = false;
+        }
+        camera::set_portrait_orientation();
+        s.set_screen(Screen::SignaturePreview);
+    })
+    .background(xilem::style::Background::Color(teal))
+    .corner_radius(26.0)
+    .border_color(Color::TRANSPARENT);
+
+    sized_box(
+        zstack((
+            sized_box(pad)
+                .expand_width()
+                .expand_height()
+                .background(xilem::style::Background::Color(Color::WHITE)),
+            flex_col((
+                label("").text_size(15.0),
+                flex_row((
+                    label("").text_size(8.0),
+                    sized_box(cancel_btn)
+                        .width(Length::px(110.0))
+                        .height(Length::px(42.0)),
+                    FlexSpacer::Flex(1.0),
+                    sized_box(clear_btn)
+                        .width(Length::px(110.0))
+                        .height(Length::px(42.0)),
+                    label("").text_size(8.0),
+                )),
+                FlexSpacer::Flex(1.0),
+                flex_row((
+                    FlexSpacer::Flex(1.0),
+                    sized_box(accept_btn)
+                        .width(Length::px(750.0))
+                        .height(Length::px(52.0)),
+                    FlexSpacer::Flex(1.0),
+                )),
+                label("").text_size(10.0),
+            )),
+        ))
+    )
+    .expand_width()
+    .expand_height()
+    .background(xilem::style::Background::Color(black))
+    .padding(xilem::style::Padding::all(3.0))
+}
+
+fn signature_preview_screen(state: &mut AppState) -> impl xilem::WidgetView<AppState> {
+    let gray  = Color::from_rgba8(116, 122, 123, 255);
+    let teal = Color::from_rgba8(0, 80, 116, 255);
+    let black = Color::from_rgba8(0, 0, 0, 255);
+    let edit_icon = image_assets::get_edit_signature_icon().clone();
+
+    let edit_btn = button(
+        sized_box(image(edit_icon))
+            .width(Length::px(65.0))
+            .height(Length::px(65.0)),
+        |s: &mut AppState| {
+            if let Ok(mut pad) = s.signature_pad.lock() {
+                pad.can_draw = true;
+            }
+            camera::set_landscape_orientation();
+            s.set_screen(Screen::SignaturePad);
+        }
+    )
+    .background(xilem::style::Background::Color(Color::TRANSPARENT))
+    .active_background_color(Color::TRANSPARENT)
+    .corner_radius(0.0)
+    .border_color(Color::TRANSPARENT)
+    .border_width(0.0);
+
+    let preview_canvas = sized_box(signature_pad_view(Arc::clone(&state.signature_pad)))
+        .width(Length::px(268.0))
+        .height(Length::px(120.0));
+
+    let signature_box = sized_box(
+        flex_col((
+            flex_row((
+                label("").text_size(12.0),
+                label("Taxpayer:")
+                    .text_size(18.0)
+                    .text_alignment(xilem::TextAlign::Left)
+                    .color(gray),
+                FlexSpacer::Flex(1.0),
+                sized_box(edit_btn)
+                    .width(Length::px(65.0))
+                    .height(Length::px(65.0)),
+            )),
+            label("").text_size(8.0),
+            flex_row((
+                label("").text_size(12.0),
+                preview_canvas,
+                label("").text_size(12.0),
+            )),
+            label("").text_size(12.0),
+        ))
+    )
+    .width(Length::px(296.0))
+    .height(Length::px(184.0))
+    .background(xilem::style::Background::Color(Color::WHITE))
+    .border_color(black)
+    .border_width(1.0);
+
+    let done_btn = text_button("SAVE", |s: &mut AppState| {
+        if let Ok(mut pad) = s.signature_pad.lock() { pad.can_draw = true; }
+        match save_signature_png(s) {
+            Ok(path) => {
+                s.signature_save_message = Some(format!("Signature saved successfully.\n{path}"));
+            }
+            Err(e) => {
+                s.signature_save_message = Some(format!("Signature could not be saved: {e}"));
+            }
+        }
+        camera::set_portrait_orientation();
+        s.set_screen(Screen::SignatureSaved);
+    })
+    .background(xilem::style::Background::Color(teal))
+    .corner_radius(24.0)
+    .border_color(Color::TRANSPARENT);
+
+    sized_box(
+        flex_col((
+            label("").text_size(44.0),
+            flex_row((
+                FlexSpacer::Flex(1.0),
+                signature_box,
+                FlexSpacer::Flex(1.0),
+            )),
+            FlexSpacer::Flex(1.0),
+            flex_row((
+                FlexSpacer::Flex(1.0),
+                sized_box(done_btn)
+                    .width(Length::px(320.0))
+                    .height(Length::px(52.0)),
+                FlexSpacer::Flex(1.0),
+            )),
+            label("").text_size(15.0),
+        ))
+    )
+    .expand_width()
+    .expand_height()
+    .background(xilem::style::Background::Color(Color::WHITE))
+}
+
+fn signature_saved_screen(state: &mut AppState) -> impl xilem::WidgetView<AppState> {
+    let teal = Color::from_rgba8(0, 80, 116, 255);
+    let black = Color::from_rgba8(0, 0, 0, 255);
+
+    let success_icon = image_assets::get_process_complete_icon().clone();
+
+    let finish_btn = text_button("FINISH", |s: &mut AppState| {
+        s.qr_result = None;
+        s.qr_pending = false;
+        s.scan_mode = ScanMode::Activation;
+        camera::consume_qr_result();
+        s.signature_save_message = None;
+        if let Ok(mut pad) = s.signature_pad.lock() {
+            pad.strokes.clear();
+            pad.can_draw = true;
+        }
+        camera::set_portrait_orientation();
+        s.set_screen(Screen::SignatureCapture);
+    })
+    .background(xilem::style::Background::Color(teal))
+    .corner_radius(24.0)
+    .border_color(Color::TRANSPARENT);
+
+    sized_box(
+        flex_col((
+            FlexSpacer::Flex(1.3),
+            flex_row((
+                FlexSpacer::Flex(1.0),
+                sized_box(image(success_icon))
+                    .width(Length::px(128.0))
+                    .height(Length::px(128.0)),
+                FlexSpacer::Flex(1.0),
+            )),
+                flex_row((
+                    sized_box(label("")).width(Length::px(24.0)),
+                    label("All captured signatures have been")
+                        .text_size(16.0)
+                        .text_alignment(xilem::TextAlign::Left)
+                        .color(black),
+                )),
+                flex_row((
+                    sized_box(label("")).width(Length::px(24.0)),
+                    label("successfully saved and are available for")
+                        .text_size(16.0)
+                        .text_alignment(xilem::TextAlign::Left)
+                        .color(black),
+                )),
+                flex_row((
+                    sized_box(label("")).width(Length::px(24.0)),
+                    label("use in MyTAXPrepOffice. Press Finish to")
+                        .text_size(16.0)
+                        .text_alignment(xilem::TextAlign::Left)
+                        .color(black),
+                )),
+                flex_row((
+                    sized_box(label("")).width(Length::px(24.0)),
+                    label("return to the captureSignatures screen.")
+                        .text_size(16.0)
+                        .text_alignment(xilem::TextAlign::Left)
+                        .color(black),
+                )),
+            FlexSpacer::Flex(0.7),
+            flex_row((
+                FlexSpacer::Flex(1.0),
+                sized_box(finish_btn)
+                    .width(Length::px(320.0))
+                    .height(Length::px(52.0)),
+                FlexSpacer::Flex(1.0),
+            )),
+            label("").text_size(20.0),
         ))
     )
     .expand_width()
