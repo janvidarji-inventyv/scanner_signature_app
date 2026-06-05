@@ -8,6 +8,7 @@ static BULLET_ICON_CELL: OnceLock<ImageBrush> = OnceLock::new();
 static SIGNATURE_ICON_CELL: OnceLock<ImageBrush> = OnceLock::new();
 static EDIT_SIGNATURE_ICON_CELL: OnceLock<ImageBrush> = OnceLock::new();
 static GET_PROCESS_COMPLETE_ICON_CELL: OnceLock<ImageBrush> = OnceLock::new();
+static LAUNCH_IMAGE_CELL: OnceLock<ImageBrush> = OnceLock::new();
 
 pub fn get_icon() -> &'static ImageBrush {
     ICON_CELL.get_or_init(|| {
@@ -94,6 +95,26 @@ pub fn get_process_complete_icon() -> &'static ImageBrush {
         let bytes = include_bytes!("assets/process_complete.png");
         let img = image::load_from_memory(bytes)
             .expect("Failed to decode process_complete.png")
+            .into_rgba8();
+        let width = img.width();
+        let height = img.height();
+        let data = img.into_raw();
+        let image_data = ImageData {
+            data: Blob::new(std::sync::Arc::new(data)),
+            format: ImageFormat::Rgba8,
+            alpha_type: ImageAlphaType::Alpha,
+            width,
+            height,
+        };
+        ImageBrush::new(image_data)
+    })
+}
+
+pub fn get_launch_image() -> &'static ImageBrush {
+    LAUNCH_IMAGE_CELL.get_or_init(|| {
+        let bytes = include_bytes!("assets/lanch.webp");
+        let img = image::load_from_memory(bytes)
+            .expect("Failed to decode lanch.webp")
             .into_rgba8();
         let width = img.width();
         let height = img.height();

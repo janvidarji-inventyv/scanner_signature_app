@@ -1,17 +1,19 @@
 // src/lib.rs
 use winit::error::EventLoopError;
+use winit::window::Icon;
 use xilem::view::ZStackExt;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 #[cfg(target_os = "android")]
 use std::sync::Once;
 
 use xilem::{
-    AnyWidgetView, EventLoopBuilder, WindowOptions, Xilem,
-    view::{FlexSpacer, button, flex_col, flex_row, image, label, sized_box, text_button, zstack},
+    AnyWidgetView, EventLoopBuilder, WindowId, Xilem, window,
+    view::{FlexSpacer, ObjectFit, button, flex_col, flex_row, image, label, sized_box, spinner, task, text_button, zstack},
 };
+use xilem::core::fork;
 use xilem::core::one_of::Either;
 use masonry::peniko::Color;
 use masonry::properties::types::Length;
@@ -52,6 +54,7 @@ fn init_safe_android_tracing() {
 
 #[derive(Clone, Debug)]
 pub enum Screen {
+    Launch,
     Info,
     Scan,
     Success,
@@ -69,6 +72,7 @@ pub enum ScanMode {
 
 pub struct AppState {
     pub screen:                Screen,
+    pub running:               bool,
     pub show_permission_error: bool,
     pub show_permission_popup: bool,
     pub is_scanning:           Arc<AtomicBool>,
@@ -77,6 +81,7 @@ pub struct AppState {
     //    transitions even if the anim-loop wakeup arrives late ──────────
     pub qr_pending:            bool,
     pub scan_mode:             ScanMode,
+    pub signature_pad_from_preview: bool,
     pub signature_pad:         Arc<Mutex<SignaturePadState>>,
     pub signature_save_message: Option<String>,
 }
@@ -95,12 +100,14 @@ impl AppState {
             // is_scanning stays false — camera is not running after a restart
             return Self {
                 screen:                Screen::Success,
+                running:               true,
                 show_permission_error: false,
                 show_permission_popup: false,
                 is_scanning:           Arc::new(AtomicBool::new(false)),
                 qr_result:             qr,
                 qr_pending:            false, // already committed via peek path
                 scan_mode:             ScanMode::Activation,
+                signature_pad_from_preview: false,
                 signature_pad:         Arc::new(Mutex::new(SignaturePadState { strokes: Vec::new(), can_draw: true, canvas_size: (0.0, 0.0) })),
                 signature_save_message: None,
             };
@@ -108,13 +115,15 @@ impl AppState {
         let show_permission_popup = camera::take_permission_settings_popup_request();
 
         Self {
-            screen:                Screen::Info,
+            screen:                Screen::Launch,
+            running:               true,
             show_permission_error: false,
             show_permission_popup,
             is_scanning:           Arc::new(AtomicBool::new(false)),
             qr_result:             None,
             qr_pending:            false,
             scan_mode:             ScanMode::Activation,
+            signature_pad_from_preview: false,
             signature_pad:         Arc::new(Mutex::new(SignaturePadState { strokes: Vec::new(), can_draw: true, canvas_size: (0.0, 0.0) })),
             signature_save_message: None,
         }
@@ -139,6 +148,76 @@ impl AppState {
 
 impl Default for AppState {
     fn default() -> Self { Self::new() }
+}
+
+impl xilem::AppState for AppState {
+    fn keep_running(&self) -> bool { self.running }
+}
+
+fn handle_system_back(state: &mut AppState) {
+    if state.show_permission_popup {
+        state.show_permission_popup = false;
+        return;
+    }
+
+    match state.screen {
+        Screen::Launch => {
+            state.running = false;
+        }
+        Screen::Info => {
+            state.running = false;
+        }
+        Screen::Scan => {
+            state.qr_result = None;
+            state.qr_pending = false;
+            camera::clear_qr_result();
+            let target = if state.scan_mode == ScanMode::Activation {
+                Screen::Info
+            } else {
+                Screen::Success
+            };
+            state.set_screen(target);
+        }
+        Screen::Success => {
+            state.set_screen(Screen::Info);
+        }
+        Screen::SignatureCapture => {
+            state.set_screen(Screen::Success);
+        }
+        Screen::SignaturePad => {
+            if let Ok(mut pad) = state.signature_pad.lock() {
+                pad.can_draw = true;
+            }
+            camera::set_portrait_orientation();
+            if state.signature_pad_from_preview {
+                state.signature_pad_from_preview = false;
+                state.set_screen(Screen::SignaturePreview);
+            } else {
+                state.set_screen(Screen::SignatureCapture);
+            }
+        }
+        Screen::SignaturePreview => {
+            if let Ok(mut pad) = state.signature_pad.lock() {
+                pad.can_draw = true;
+            }
+            state.signature_pad_from_preview = true;
+            camera::set_landscape_orientation();
+            state.set_screen(Screen::SignaturePad);
+        }
+        Screen::SignatureSaved => {
+            state.qr_result = None;
+            state.qr_pending = false;
+            state.scan_mode = ScanMode::Activation;
+            camera::consume_qr_result();
+            state.signature_save_message = None;
+            if let Ok(mut pad) = state.signature_pad.lock() {
+                pad.strokes.clear();
+                pad.can_draw = true;
+            }
+            camera::set_portrait_orientation();
+            state.set_screen(Screen::SignatureCapture);
+        }
+    }
 }
 
 fn app_logic(state: &mut AppState) -> Box<AnyWidgetView<AppState>> {
@@ -220,6 +299,7 @@ fn app_logic(state: &mut AppState) -> Box<AnyWidgetView<AppState>> {
     }
 
     match state.screen {
+        Screen::Launch             => Box::new(launch_screen()),
         Screen::Info               => Box::new(info_screen(state)),
         Screen::Scan               => Box::new(scan_screen(state)),
         Screen::Success            => Box::new(success_screen(state)),
@@ -228,6 +308,52 @@ fn app_logic(state: &mut AppState) -> Box<AnyWidgetView<AppState>> {
         Screen::SignaturePreview   => Box::new(signature_preview_screen(state)),
         Screen::SignatureSaved     => Box::new(signature_saved_screen(state)),
     }
+}
+
+fn launch_screen() -> impl xilem::WidgetView<AppState> {
+    let launch = image_assets::get_launch_image().clone();
+
+    fork(
+        sized_box(
+            zstack((
+                sized_box(image(launch).fit(ObjectFit::Cover))
+                    .expand_width()
+                    .expand_height(),
+                flex_col((
+                    FlexSpacer::Flex(1.0),
+                    flex_row((
+                        FlexSpacer::Flex(1.0),
+                        sized_box(spinner())
+                            .width(Length::px(56.0))
+                            .height(Length::px(56.0)),
+                        FlexSpacer::Flex(1.0),
+                    )),
+                    FlexSpacer::Flex(1.0),
+                )),
+            ))
+        )
+        .expand_width()
+        .expand_height()
+        .background(xilem::style::Background::Color(Color::WHITE)),
+        task(
+            |proxy| async move {
+                std::thread::sleep(Duration::from_millis(5000));
+                let _ = proxy.message(());
+            },
+            |state: &mut AppState, ()| {
+                if matches!(state.screen, Screen::Launch) {
+                    state.set_screen(Screen::Info);
+                }
+            },
+        ),
+    )
+}
+
+fn load_window_icon() -> Option<Icon> {
+    let bytes = include_bytes!("assets/icon_sign_pad.webp");
+    let img = image::load_from_memory(bytes).ok()?.into_rgba8();
+    let (w, h) = (img.width(), img.height());
+    Icon::from_rgba(img.into_raw(), w, h).ok()
 }
 
 fn draw_line_rgba(
@@ -448,7 +574,7 @@ fn info_screen(state: &mut AppState) -> impl xilem::WidgetView<AppState> {
         step2,
         label("").text_size(2.0),
         step3,
-    )).padding(xilem::style::Padding::left(16.0));
+    )).padding(xilem::style::Padding::horizontal(16.0));
 
     // ── Footer note ───────────────────────────────────────────────────────────
     let footer = flex_col((
@@ -474,9 +600,10 @@ fn info_screen(state: &mut AppState) -> impl xilem::WidgetView<AppState> {
         label("").text_size(14.0),
         error_label,
         sized_box(btn)
-            .width(Length::px(320.0))
-            .height(Length::px(52.0)),
-        label("").text_size(16.0),
+            .expand_width()
+            .height(Length::px(52.0))
+            .padding(xilem::style::Padding::right(25.0)),
+        label("").text_size(34.0),
     ));
 
     let base = sized_box(
@@ -731,7 +858,7 @@ fn success_screen(_state: &AppState) -> impl xilem::WidgetView<AppState> {
         step4,
         //label("").text_size(2.0),
         step5,
-    )).padding(xilem::style::Padding::left(16.0));
+    )).padding(xilem::style::Padding::horizontal(16.0));
 
     // ── Button ────────────────────────────────────────────────────────────────
     let btn = text_button("CAPTURE SIGNATURE", |s: &mut AppState| {
@@ -750,11 +877,12 @@ fn success_screen(_state: &AppState) -> impl xilem::WidgetView<AppState> {
         flex_row((
             FlexSpacer::Flex(1.0),
             sized_box(btn)
-                .width(Length::px(320.0))
-                .height(Length::px(52.0)),
+                .expand_width()
+                .height(Length::px(52.0))
+                .padding(xilem::style::Padding::right(25.0)),
             FlexSpacer::Flex(1.0),
         )),
-        label("").text_size(16.0),
+        label("").text_size(34.0),
     ));
 
     sized_box(
@@ -800,6 +928,7 @@ fn signature_capture_screen(state: &mut AppState) -> impl xilem::WidgetView<AppS
     ));
 
     let btn = text_button("DRAW SIGNATURE", |s: &mut AppState| {
+        s.signature_pad_from_preview = false;
         if let Ok(mut pad) = s.signature_pad.lock() {
             pad.strokes.clear();
             pad.can_draw = true;
@@ -816,11 +945,12 @@ fn signature_capture_screen(state: &mut AppState) -> impl xilem::WidgetView<AppS
         flex_row((
             FlexSpacer::Flex(1.0),
             sized_box(btn)
-                .width(Length::px(320.0))
-                .height(Length::px(52.0)),
+                .expand_width()
+                .height(Length::px(52.0))
+                .padding(xilem::style::Padding::right(25.0)),
             FlexSpacer::Flex(1.0),
         )),
-        label("").text_size(16.0),
+        label("").text_size(34.0),
     ));
 
     sized_box(
@@ -862,7 +992,12 @@ fn signature_pad_screen(state: &mut AppState) -> impl xilem::WidgetView<AppState
             pad.can_draw = true;
         }
         camera::set_portrait_orientation();
-        s.set_screen(Screen::SignatureCapture);
+        if s.signature_pad_from_preview {
+            s.signature_pad_from_preview = false;
+            s.set_screen(Screen::SignaturePreview);
+        } else {
+            s.set_screen(Screen::SignatureCapture);
+        }
     })
     .background(xilem::style::Background::Color(teal))
     .corner_radius(22.0)
@@ -896,7 +1031,7 @@ fn signature_pad_screen(state: &mut AppState) -> impl xilem::WidgetView<AppState
                 .expand_height()
                 .background(xilem::style::Background::Color(Color::WHITE)),
             flex_col((
-                label("").text_size(15.0),
+                label("").text_size(10.0),
                 flex_row((
                     label("").text_size(8.0),
                     sized_box(cancel_btn)
@@ -937,6 +1072,7 @@ fn signature_preview_screen(state: &mut AppState) -> impl xilem::WidgetView<AppS
             .width(Length::px(65.0))
             .height(Length::px(65.0)),
         |s: &mut AppState| {
+            s.signature_pad_from_preview = true;
             if let Ok(mut pad) = s.signature_pad.lock() {
                 pad.can_draw = true;
             }
@@ -1015,7 +1151,7 @@ fn signature_preview_screen(state: &mut AppState) -> impl xilem::WidgetView<AppS
                     .height(Length::px(52.0)),
                 FlexSpacer::Flex(1.0),
             )),
-            label("").text_size(15.0),
+            label("").text_size(34.0),
         ))
     )
     .expand_width()
@@ -1088,11 +1224,12 @@ fn signature_saved_screen(state: &mut AppState) -> impl xilem::WidgetView<AppSta
             flex_row((
                 FlexSpacer::Flex(1.0),
                 sized_box(finish_btn)
-                    .width(Length::px(320.0))
-                    .height(Length::px(52.0)),
+                    .expand_width()
+                    .height(Length::px(52.0))
+                    .padding(xilem::style::Padding::right(25.0)),
                 FlexSpacer::Flex(1.0),
             )),
-            label("").text_size(20.0),
+            label("").text_size(34.0),
         ))
     )
     .expand_width()
@@ -1102,11 +1239,17 @@ fn signature_saved_screen(state: &mut AppState) -> impl xilem::WidgetView<AppSta
 
 // ── Entry points ──────────────────────────────────────────────────────────────
 pub fn run(event_loop: EventLoopBuilder) -> Result<(), EventLoopError> {
-    let app = Xilem::new_simple(
-        AppState::new(),
-        app_logic,
-        WindowOptions::new("Scanner Signature App"),
-    );
+    let main_window_id = WindowId::next();
+    let window_icon = load_window_icon();
+    let app = Xilem::new(AppState::new(), move |state: &mut AppState| {
+        std::iter::once(
+            window(main_window_id, "Scanner Signature App", app_logic(state))
+                .with_options(|o| {
+                    o.on_close(handle_system_back)
+                        .with_initial_window_icon(window_icon.clone())
+                }),
+        )
+    });
     app.run_in(event_loop)
 }
 
@@ -1193,16 +1336,27 @@ pub extern "C" fn android_main(app: android_activity::AndroidApp) {
         }));
 
         match result {
-            Ok(Ok(())) => { break; }
-            Ok(Err(e)) => {
-                let msg = e.to_string();
+            Ok(Ok(())) => {
+                break;
+            }
+            Ok(Err(EventLoopError::RecreationAttempt)) => {
                 camera::reset_runtime_state();
-                if msg.contains("can't be recreated") || msg.contains("EventLoop") {
-                    wait_for_android_resume(&app);
-                } else {
-                    log::error!("\u{274C} EventLoopError: {e}");
-                    std::thread::sleep(std::time::Duration::from_millis(300));
-                }
+                wait_for_android_resume(&app);
+            }
+            Ok(Err(EventLoopError::ExitFailure(status))) => {
+                log::info!("[MAIN] event loop exited with status {status}");
+                camera::reset_runtime_state();
+                break;
+            }
+            Ok(Err(EventLoopError::Os(e))) => {
+                log::info!("[MAIN] event loop terminated (OS): {e}");
+                camera::reset_runtime_state();
+                break;
+            }
+            Ok(Err(EventLoopError::NotSupported(e))) => {
+                log::info!("[MAIN] event loop terminated (NotSupported): {e}");
+                camera::reset_runtime_state();
+                break;
             }
             Err(_) => {
                 log::error!("\u{274C} Panic in event loop");

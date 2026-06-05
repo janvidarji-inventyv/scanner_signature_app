@@ -1,0 +1,25 @@
+graph TD
+    A[App Open] --> L[Launch Screen]
+    L -->|Auto after splash delay| B[Info Screen: Activate Your Device]
+
+    %% Activation flow
+    B -->|Tap Activate Signature Pad| C[Request Camera Permission]
+    C -->|Granted| D[Scan QR: Activation Mode]
+    C -->|Denied| E[Permission Required Popup]
+    E -->|Cancel| B
+    E -->|Go to Settings| G[Open App Settings]
+    G -->|Return to app| B
+    D -->|QR detected| H[Success Screen: Capture Signature Info]
+
+    %% Signature capture flow
+    H -->|Tap Capture Signature| J[Scan QR: Signature Capture Mode]
+    J -->|QR detected| K[Signature Capture Screen]
+    K -->|Tap Draw Signature| P[Signature Pad]
+
+    %% Signature pad and save flow
+    P -->|Clear| P
+    P -->|Cancel| K
+    P -->|Accept| Q[Signature Preview]
+    Q -->|Edit| P
+    Q -->|Save Signature| R[Signature Saved]
+    R -->|Finish| K

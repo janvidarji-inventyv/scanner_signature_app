@@ -2,6 +2,85 @@
 
 This document explains the architecture of the scanner signature application and provides diagrams for the main runtime and screen flow.
 
+## Project Overview
+
+### Purpose
+
+This project is an Android signature workflow application built with Rust for safety, performance, and modern UI behavior.
+
+### Core Features
+
+- Camera permission handling with Android-aware request and retry flow.
+- QR-based signature workflow entry using the device camera.
+- Signature draw, preview, save, and finish screens.
+- Custom permission popup and responsive UI behavior.
+- Crash-aware runtime recovery for Android event-loop and graphics failures.
+
+### Architecture Summary
+
+1. Rust Core
+- Owns app state, navigation, and screen logic.
+- Renders the full UI using Rust-native view/widget code.
+- Uses Rust type safety and ownership to reduce runtime errors.
+
+2. Android Integration
+- Uses JNI and android-activity to interact with Android runtime features.
+- Handles permission checks, app settings redirection, orientation control, and lifecycle callbacks.
+
+3. UI Framework
+- Uses Xilem for declarative UI composition.
+- Uses Masonry for layout/widget infrastructure and styling primitives.
+- Uses responsive layout patterns to support varying Android screen sizes.
+
+4. Camera and Scan Layer
+- Uses Android Camera2 through NDK bindings for preview and scanning.
+- Decodes QR payloads and forwards results into app state transitions.
+- Uses atomic flags and synchronization primitives to avoid permission/scan races.
+
+### Key Technical Behaviors
+
+1. Camera Permission Flow
+- Detects current permission state and requests when needed.
+- Shows a custom permission-required popup with Settings redirection when denied.
+- Uses atomic state guards to reduce duplicate prompts and race conditions.
+
+2. Signature Workflow
+- Activation path enters QR scan and transitions to capture instructions after successful scan.
+- Capture path scans QR and then moves through draw, preview, save, and finish screens.
+- Signature drawing is handled in-app via signature pad views.
+
+3. Error Handling and Recovery
+- Handles event-loop and graphics-related failures with restart-safe state handling.
+- Resets runtime camera/scan state as needed to restore stability.
+
+4. Responsive UI
+- Popups, buttons, and text blocks are sized and spaced for mobile screens.
+- Multi-line text handling improves readability across device sizes.
+
+### Tools and Libraries
+
+- Rust: Core application language.
+- Xilem: Declarative UI framework.
+- Masonry: Layout and widget system.
+- JNI and android-activity: Android platform integration.
+- Vello and wgpu: Rendering backend stack.
+- Cargo: Rust build and dependency management.
+- Gradle: Android host app build and packaging.
+
+### Development Workflow
+
+1. Code
+- Rust sources implement app logic, camera flow, and screens.
+
+2. Build
+- Built with Cargo for Rust components and Gradle for Android packaging.
+
+3. Test
+- Validated on Android devices for permission UX, screen transitions, and stability.
+
+4. Deploy
+- Packaged as an Android application with the Rust library integrated.
+
 ## 1) High-Level Architecture
 
 The project is a Rust Android application built as a `cdylib`, rendered with Xilem/Masonry/Vello, and integrated with Android Camera2 through NDK APIs.
@@ -13,7 +92,7 @@ The project is a Rust Android application built as a `cdylib`, rendered with Xil
 - Calls Rust entrypoint `android_main`.
 
 2. App orchestration layer
-- `src/lib.rs` defines `AppState`, screen routing (`Info`, `Scan`, `Success`), and app lifecycle setup.
+- `src/lib.rs` defines `AppState`, screen routing (`Launch`, `Info`, `Scan`, `Success`, `SignatureCapture`, `SignaturePad`, `SignaturePreview`, `SignatureSaved`), and app lifecycle setup.
 - Owns top-level UI logic (`app_logic`).
 
 3. Camera and QR service layer
@@ -79,11 +158,22 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Info
-    Info --> Scan: Activate Signature Pad / permission granted
-    Scan --> Success: QR detected and committed
-    Success --> Info: CAPTURE SIGNATURE button
-    Scan --> Info: camera hidden or flow reset
+    [*] --> Launch
+    Launch --> Info: Splash complete
+
+    Info --> ScanActivation: Activate Signature Pad
+    ScanActivation --> Info: Permission denied / cancel
+    ScanActivation --> Success: QR detected
+
+    Success --> ScanCapture: Capture Signature
+    ScanCapture --> SignatureCapture: QR detected
+
+    SignatureCapture --> SignaturePad: Draw Signature
+    SignaturePad --> SignatureCapture: Cancel
+    SignaturePad --> SignaturePreview: Accept
+    SignaturePreview --> SignaturePad: Edit
+    SignaturePreview --> SignatureSaved: Save Signature
+    SignatureSaved --> SignatureCapture: Finish
 ```
 
 ## 5) QR Detection and Commit Flow
@@ -91,13 +181,42 @@ stateDiagram-v2
 ```mermaid
 flowchart TD
     A[Camera Thread Captures Frame] --> B[Decode QR with rqrr]
-    B -->|QR found| C[store_qr_result + set QR_READY=true]
+    B -->|QR found| C[store_qr_result and set QR_READY=true]
     C --> D[CameraViewWidget on_anim_frame]
     D --> E[Submit QrDetected action]
-    E --> F[CameraView.message]
-    F --> G[state.set_screen Success]
-    G --> H[consume_qr_result]
-    H --> I[UI shows success screen]
+    E --> F[app_logic reads peek_qr_result]
+    F --> G[Set qr_pending=true and choose next screen by scan_mode]
+    G --> H[Activation: set_screen Success]
+    G --> I[Signature Capture: set_screen SignatureCapture]
+    H --> J[consume_qr_result commit]
+    I --> J
+```
+
+## 5.1) End-to-End App Flow Diagram
+
+```mermaid
+flowchart TD
+    A[App Open] --> L[Launch Screen]
+    L -->|Auto after splash delay| B[Info Screen: Activate Your Device]
+
+    B -->|Tap Activate Signature Pad| C[Request Camera Permission]
+    C -->|Granted| D[Scan QR: Activation Mode]
+    C -->|Denied| E[Permission Required Popup]
+    E -->|Cancel| B
+    E -->|Go to Settings| G[Open App Settings]
+    G -->|Return to app| B
+    D -->|QR detected| H[Success Screen: Capture Signature Info]
+
+    H -->|Tap Capture Signature| J[Scan QR: Signature Capture Mode]
+    J -->|QR detected| K[Signature Capture Screen]
+    K -->|Tap Draw Signature| P[Signature Pad]
+
+    P -->|Clear| P
+    P -->|Cancel| K
+    P -->|Accept| Q[Signature Preview]
+    Q -->|Edit| P
+    Q -->|Save Signature| R[Signature Saved]
+    R -->|Finish| K
 ```
 
 ## 6) Core Modules and Responsibilities
@@ -105,7 +224,7 @@ flowchart TD
 ### `src/lib.rs`
 - Defines `Screen` and `AppState`.
 - Contains `app_logic` state transitions and root view selection.
-- Defines `info_screen`, `scan_screen`, `success_screen`.
+- Defines all UI screens (launch, activation info, scan, success, signature capture, signature pad, preview, saved).
 - Android entrypoint and event-loop restart wrapper.
 
 ### `src/camera.rs`
@@ -120,7 +239,7 @@ flowchart TD
 - Draws scan overlay and sends `QrDetected` action.
 
 ### `src/image_assets.rs`
-- Provides image resources used by `Info` and `Success` screens.
+- Provides image resources used across activation and signature-capture screens.
 
 ## 7) Directory Architecture Summary
 
